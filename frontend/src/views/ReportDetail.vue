@@ -50,13 +50,36 @@
             <span v-else class="muted">-</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="100" fixed="right">
+        <el-table-column label="操作" width="150" fixed="right">
           <template #default="{ row }">
             <el-button size="small" type="primary" link @click="openDetail(row)">详情</el-button>
+            <el-button v-if="row.status === 'failed'" size="small" type="warning" link @click="openFixDialog(row)">
+              AI 修复
+            </el-button>
           </template>
         </el-table-column>
       </el-table>
     </el-card>
+
+    <!-- AI 自动修复提交对话框 -->
+    <el-dialog v-model="fixDialog" title="AI 自动修复" width="580px">
+      <el-form label-width="90px">
+        <el-form-item label="用例名">
+          <el-input v-model="fixForm.case_name" placeholder="pytest 用例函数名,如 test_login_success" />
+        </el-form-item>
+        <el-form-item label="文件路径" required>
+          <el-input v-model="fixForm.file_path" placeholder="相对项目一根目录,如 testcases/test_login.py" />
+          <div class="hint">Agent 将读取该文件、生成最小修复补丁并验证;源码仅在人工审核通过后才修改</div>
+        </el-form-item>
+        <el-form-item label="错误日志">
+          <el-input v-model="fixForm.error_log" type="textarea" :rows="4" placeholder="可留空,Agent 会先运行用例复现失败" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="fixDialog = false">取消</el-button>
+        <el-button type="primary" :loading="fixing" @click="submitFix">提交修复</el-button>
+      </template>
+    </el-dialog>
 
     <!-- 失败详情抽屉 -->
     <el-drawer v-model="drawer" :title="selected?.case_name" size="46%">
@@ -80,7 +103,8 @@
 
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
-import { getReport } from '../api'
+import { ElMessage } from 'element-plus'
+import { getReport, triggerAutoFix } from '../api'
 
 const props = defineProps({ id: { type: [String, Number], required: true } })
 
@@ -108,6 +132,34 @@ const aiPlaceholder = (s) =>
 function openDetail(row) {
   selected.value = row
   drawer.value = true
+}
+
+// ===== AI 自动修复 =====
+const fixDialog = ref(false)
+const fixing = ref(false)
+const fixForm = ref({ file_path: '', case_name: '', error_log: '' })
+let fixRow = null  // 触发来源行(携带 result_id 供补丁追溯)
+
+function openFixDialog(row) {
+  fixRow = row
+  // 预填用例名与错误日志;文件路径由用户指定(Agent 的工具只能访问项目一目录)
+  fixForm.value = { file_path: '', case_name: row.case_name, error_log: row.error_message || '' }
+  fixDialog.value = true
+}
+
+async function submitFix() {
+  if (!fixForm.value.file_path.trim()) {
+    ElMessage.warning('请填写失败用例所在文件路径')
+    return
+  }
+  fixing.value = true
+  try {
+    await triggerAutoFix({ ...fixForm.value, task_id: Number(props.id), result_id: fixRow?.id })
+    ElMessage.success('已提交后台执行,请前往「修复建议」页查看进度与结果')
+    fixDialog.value = false
+  } finally {
+    fixing.value = false
+  }
 }
 
 async function load() {
@@ -142,6 +194,7 @@ onBeforeUnmount(stopPolling)
 .result-card { margin-bottom: 16px; }
 .tag { margin-right: 4px; }
 .muted { color: #c0c4cc; }
+.hint { font-size: 12px; color: #909399; line-height: 1.5; margin-top: 4px; }
 .err-text { color: #f56c6c; font-size: 12px; }
 .code-block {
   background: #f6f8fa; border-radius: 6px; padding: 12px;

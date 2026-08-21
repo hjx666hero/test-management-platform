@@ -8,3 +8,6 @@ requests>=2.31
 
 # 通义千问 SDK(可选;未安装则走 OpenAI 兼容 HTTP 接口)
 dashscope>=1.20
+
+# Auto-Fix Agent(OpenAI 兼容模式调通义千问 function calling)
+openai>=1.30

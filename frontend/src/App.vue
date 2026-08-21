@@ -5,6 +5,7 @@
       <el-menu mode="horizontal" :default-active="$route.path" router class="menu">
         <el-menu-item index="/tasks">任务列表</el-menu-item>
         <el-menu-item index="/tasks/new">创建任务</el-menu-item>
+        <el-menu-item index="/fixes">修复建议</el-menu-item>
       </el-menu>
     </el-header>
     <el-main>
