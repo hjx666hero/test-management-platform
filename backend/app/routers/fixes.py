@@ -7,6 +7,7 @@
     PATCH /api/fixes/suggestions/{id}  人工审核:applied=应用补丁 / rejected=拒绝
 """
 import logging
+import uuid
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 
@@ -20,10 +21,16 @@ router = APIRouter(prefix="/api/fixes", tags=["fixes"])
 
 @router.post("/auto-fix", status_code=202)
 def trigger_auto_fix(payload: schemas.AutoFixRequest, background: BackgroundTasks):
-    """提交一条失败用例给 Auto-Fix Agent(ReAct 循环,最多 3 轮,后台异步执行)。"""
+    """提交一条失败用例给 Auto-Fix Agent(ReAct 循环,后台异步执行)。
+
+    返回 trace_id:前端凭它订阅 SSE 实时思考流
+    (GET /api/agent/trace/{trace_id}/events),逐轮观看 Agent 的思考与工具调用。
+    """
     if not AGENT_ENABLED:
         raise HTTPException(status_code=400, detail="未配置 DASHSCOPE_API_KEY,Agent 不可用")
 
+    # 预生成 trace_id:提交即返回,前端可在后台任务启动前先连上 SSE
+    trace_id = uuid.uuid4().hex
     # 与平台任务执行(run_task)一致的 BackgroundTasks 接入方式
     background.add_task(
         auto_fix_case,
@@ -32,9 +39,13 @@ def trigger_auto_fix(payload: schemas.AutoFixRequest, background: BackgroundTask
         case_name=payload.case_name,
         file_path=payload.file_path,
         error_log=payload.error_log,
+        trace_id=trace_id,
     )
-    logger.info("Auto-Fix 已提交后台: case=%s file=%s", payload.case_name, payload.file_path)
-    return {"message": "Auto-Fix 已提交后台执行,请稍后在「修复建议」页查看结果"}
+    logger.info("Auto-Fix 已提交后台: case=%s file=%s trace=%s", payload.case_name, payload.file_path, trace_id)
+    return {
+        "message": "Auto-Fix 已提交后台执行,请稍后在「修复建议」页查看结果",
+        "trace_id": trace_id,
+    }
 
 
 @router.get("/suggestions", response_model=list[schemas.FixSuggestionOut])

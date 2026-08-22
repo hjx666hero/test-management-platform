@@ -11,3 +11,12 @@ dashscope>=1.20
 
 # Auto-Fix Agent(OpenAI 兼容模式调通义千问 function calling)
 openai>=1.30
+
+# Agent 工程韧性:LLM 调用重试(指数退避) + 补丁写文件的跨进程互斥锁
+# 安装: pip install tenacity filelock
+tenacity>=8.2
+filelock>=3.13
+
+# RAG 记忆:本地向量库(修复案例 embedding 存取,Few-shot 检索)
+# 安装: pip install chromadb   (纯本地库,无需服务端;首次 import 会下载默认中文向量模型)
+chromadb>=0.5

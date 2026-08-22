@@ -18,12 +18,16 @@
 - env_url 通过 BASE_URL 环境变量注入,支持指定被测环境。
 """
 import difflib
+import hashlib
 import logging
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Optional, Tuple
+
+from filelock import FileLock, Timeout
 
 from .. import config as app_config
 from . import db
@@ -32,8 +36,23 @@ from .models import ToolResult
 
 logger = logging.getLogger("tms.agent.tools")
 
+# 文件锁获取超时(秒):必须覆盖"锁定→替换→pytest 运行(最长约 300s)→还原"全程
+LOCK_TIMEOUT = 600
+
 
 # ==================== 公共辅助 ====================
+
+def _file_lock(path: Path) -> FileLock:
+    """取目标文件的跨进程互斥锁(filelock)。
+
+    - 锁文件按"绝对路径哈希"统一放在系统临时目录:同一文件无论被哪个
+      进程/哪次修复任务触碰,竞争的都是同一把锁,且不污染项目一源码目录;
+    - 锁必须由调用方在 finally 中 release(见 run_pytest / review.review_suggestion)。
+    """
+    digest = hashlib.md5(str(path).encode("utf-8")).hexdigest()[:16]
+    lock_dir = Path(tempfile.gettempdir()) / "tms_agent_locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    return FileLock(str(lock_dir / f"{digest}.lock"), timeout=LOCK_TIMEOUT)
 
 def _truncate(text: str, limit: int = MAX_TOOL_OUTPUT_CHARS) -> str:
     """截断工具输出,防止大文件/长日志把 LLM 上下文 token 撑爆。"""
@@ -182,20 +201,14 @@ def generate_patch(
 
 # ==================== 工具 4:run_pytest ====================
 
-def _temporarily_apply_patch(patch_id: int) -> Tuple[Optional[object], Optional[str]]:
+def _temporarily_apply_patch(row: dict, path: Path) -> Tuple[Optional[object], Optional[str]]:
     """临时应用补丁:备份原内容 → 替换 original_code 为 fixed_code → 返回还原函数。
 
+    前置约定:调用方(run_pytest)已持有该文件的 filelock——锁必须覆盖
+    "替换→运行→还原"全程,否则两个并发任务会互相还原对方的备份。
     通过闭包 + 调用方 try/finally 保证:无论测试运行结果如何,
     源码最终都会还原——"验证修复效果"与"不修改源码"两全。
     """
-    row = db.get_suggestion(patch_id)
-    if not row:
-        return None, f"补丁不存在: patch_id={patch_id}"
-
-    path, err = _resolve_path(row["file_path"])
-    if err or not path.is_file():
-        return None, f"补丁目标文件不可访问: {row['file_path']}"
-
     content = path.read_text(encoding="utf-8", errors="replace")
     if row["original_code"] not in content:
         return None, "补丁无法应用: original_code 与当前文件内容不匹配(文件可能已变更)"
@@ -206,7 +219,7 @@ def _temporarily_apply_patch(patch_id: int) -> Tuple[Optional[object], Optional[
     def _restore() -> None:
         """还原源码(finally 中调用,保证零残留)。"""
         path.write_text(backup, encoding="utf-8")
-        logger.info("补丁 %s 验证完成,源码已还原: %s", patch_id, path)
+        logger.info("补丁 %s 验证完成,源码已还原: %s", row["id"], path)
 
     return _restore, None
 
@@ -244,29 +257,70 @@ def run_pytest(
 ) -> dict:
     """执行 pytest 测试用例并返回结果;可临时应用补丁验证修复效果。
 
-    两种用法:
+    用法:
     a. test_path(+ test_name):组装 node id(如 testcases/test_login.py::test_xxx),
        在项目一目录下执行真实 pytest(自动加载其 pytest.ini);
        仅 test_name 时用 -k 关键字匹配(支持参数化后缀,如 normal_title);
     b. patch_id:运行前临时应用该补丁,结束后自动还原源码,并把
        验证结论回写补丁记录(db.mark_verified)。
+
+    回归感知验证(P0):带 patch_id 且 test_path 是 .py 测试文件时,
+    执行"整个测试文件"而非单条目标用例——补丁把同文件其他用例改坏
+    (修复 A 弄坏 B)会被检出,verified 只有整文件全过才为 True。
+    目标用例本身包含在文件内,故一轮执行同时覆盖"修复有效 + 无回归"。
+
+    并发安全:带 patch_id 时对目标文件加 filelock,且锁覆盖
+    "替换 → pytest 运行 → 还原"全程——防止两个 Agent 任务对同一文件
+    交错写/交错还原(短锁只保护写入是不够的)。
     """
     restore = None
+    lock = None
     try:
-        # 步骤 1:如指定补丁,先临时应用(源码被替换,finally 中还原)
+        # 步骤 1:如指定补丁,先取文件锁再临时应用(锁内替换,finally 先还原后释放)
         if patch_id:
-            restore, err = _temporarily_apply_patch(patch_id)
+            row = db.get_suggestion(patch_id)
+            if not row:
+                return {"success": False, "output": f"补丁不存在: patch_id={patch_id}"}
+            path, err = _resolve_path(row["file_path"])
+            if err or not path.is_file():
+                return {"success": False, "output": f"补丁目标文件不可访问: {row['file_path']}"}
+
+            candidate = _file_lock(path)
+            try:
+                candidate.acquire(timeout=LOCK_TIMEOUT)
+                lock = candidate  # 只有成功持有才纳入 finally 管理
+            except Timeout:
+                return {
+                    "success": False,
+                    "output": f"目标文件 {row['file_path']} 正被其他修复任务锁定,请稍后重试",
+                }
+
+            restore, err = _temporarily_apply_patch(row, path)
             if err:
                 return {"success": False, "output": err}
 
         # 步骤 2:确定执行目标
-        if test_path:
-            # 文件[::用例名] 组装 node id
+        if patch_id and test_path and test_path.endswith(".py"):
+            # ---- 回归感知验证:跑整个测试文件(含目标用例与同文件全部用例) ----
+            passed, tail = _run_pytest_subprocess([test_path], env_url)
+            if passed:
+                verdict = "通过(回归感知:同文件全部用例通过,无回归)"
+            else:
+                verdict = "未通过(目标或同文件其他用例失败,存在回归或修复无效)"
+        elif test_path:
+            # 普通执行(无补丁):精确到单条 node id
             node_id = test_path + (f"::{test_name}" if test_name else "")
             passed, tail = _run_pytest_subprocess([node_id], env_url)
+            verdict = "通过" if passed else "未通过"
+            if patch_id:
+                # 带补丁但路径不是 .py(如 yaml):降级为只跑匹配用例并明确标注
+                verdict += "(仅目标用例,未做同文件回归:请提供 .py 测试文件路径以启用回归检测)"
         elif test_name:
             # 仅用例名:-k 关键字匹配(函数名或参数化 id 均可命中)
             passed, tail = _run_pytest_subprocess(["testcases/", "-k", test_name], env_url)
+            verdict = "通过" if passed else "未通过"
+            if patch_id:
+                verdict += "(仅匹配用例,未做同文件回归:请提供 .py 测试文件路径以启用回归检测)"
         else:
             return {"success": False, "output": "请至少提供 test_path 或 test_name 之一"}
 
@@ -275,16 +329,18 @@ def run_pytest(
             db.mark_verified(patch_id, passed, tail)
             logger.info("补丁 %s 验证结论: %s", patch_id, "通过" if passed else "未通过")
 
-        verdict = "通过" if passed else "未通过"
         return {
             "success": True,  # 工具执行成功(用例本身通过与否见 output 与 data.passed)
             "output": _truncate(f"运行结果: {verdict}\n{tail}"),
             "data": {"passed": passed},
         }
     finally:
-        # 无论成功/异常/超时,都还原源码——Agent 全程不真实修改被测代码
+        # 无论成功/异常/超时:先还原源码(Agent 全程不真实修改被测代码),
+        # 再释放文件锁——顺序不能反,还原完成前其他任务不得触碰该文件
         if restore:
             restore()
+        if lock is not None:
+            lock.release()
 
 
 # ==================== OpenAI function calling Schema ====================
@@ -352,7 +408,9 @@ OPENAI_TOOLS = [
                 "执行项目一的 pytest 测试用例并返回结果。"
                 "test_path+test_name 组成 node id 精确执行(如 testcases/test_articles.py::test_create_article);"
                 "仅传 test_name 时按关键字匹配(支持参数化 id,如 normal_title);"
-                "传 patch_id 可临时应用补丁验证修复效果(运行后自动还原源码)。"
+                "传 patch_id 可临时应用补丁验证修复效果(运行后自动还原源码)——"
+                "验证补丁时务必传 .py 测试文件路径(test_path),将执行同文件全部用例做回归检测,"
+                "全部通过才算验证通过,防止修复一条用例弄坏其他用例。"
             ),
             "parameters": {
                 "type": "object",

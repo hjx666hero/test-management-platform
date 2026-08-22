@@ -76,6 +76,9 @@ class FixSuggestionOut(BaseModel):
     status: str = Field(..., description="pending_review/applied/rejected")
     verified: Optional[bool] = Field(None, description="None=未验证 / True/False=Agent 验证结论")
     verify_output: Optional[str]
+    judge_score: Optional[int] = Field(None, description="LLM-as-judge 评分 0-10(None=未评审)")
+    judge_verdict: Optional[str] = Field(None, description="approve/warn/reject")
+    judge_comment: Optional[str] = Field(None, description="评审意见(安全性/最小性/正确性)")
     created_at: Optional[datetime]
 
 
@@ -83,3 +86,10 @@ class FixStatusUpdate(BaseModel):
     """人工审核动作。"""
 
     status: str = Field(..., description="applied=应用补丁到源文件 / rejected=拒绝")
+
+
+class AgentAskRequest(BaseModel):
+    """Agent 对话接口(/ask)请求:针对某条补丁向 Agent 提问。"""
+
+    patch_id: int = Field(..., description="修复建议 ID(补丁)")
+    question: str = Field(..., min_length=1, max_length=2000, description="用户问题,如'为什么这样改?'")

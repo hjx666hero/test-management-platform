@@ -19,8 +19,11 @@ LLM 接入:通义千问 DashScope 的 OpenAI 兼容模式(openai SDK 指定 base
 """
 import json
 import logging
+import uuid
 
-from . import db, tools
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+from . import db, judge, memory, tools
 from .config import (
     AGENT_ENABLED,
     AI_MODEL,
@@ -56,8 +59,23 @@ SYSTEM_PROMPT = """你是资深测试开发工程师,任务:自动修复失败�
    不改用例,明确说明并建议提交给开发;
 3. generate_patch 的 original_code 必须先用 read_file 获取,保证与文件逐字符一致。
 
-建议节奏:第 1 轮取证(git diff / read_file / run_pytest 复现),
-第 2 轮生成补丁,第 3 轮验证并总结。"""
+建议节奏:前 1-2 轮取证(git diff / read_file / run_pytest 复现),
+随后生成补丁并传 patch_id 验证;补丁一旦验证通过(PASSED)任务即完成,
+输出简短总结(根因+修复方案+验证结论)收尾,不要再调用工具。"""
+
+
+@retry(
+    stop=stop_after_attempt(3),                       # 最多尝试 3 次(含首次)
+    wait=wait_exponential(multiplier=2, min=2, max=30),  # 指数退避:2s → 4s → 8s...
+    reraise=True,                                     # 重试耗尽后抛原始异常,交外层统一兜底
+)
+def _create_completion(client, **kwargs):
+    """LLM 调用 + tenacity 重试:网络抖动/限流/瞬时 5xx 自动退避重试。
+
+    只包住 completions.create 这一个瞬时故障点;参数级错误(4xx)
+    重试同样无意义,但发生概率极低,统一策略换取实现简单。
+    """
+    return client.chat.completions.create(**kwargs)
 
 
 def _get_llm_client():
@@ -87,18 +105,64 @@ class AutoFixAgent:
         )).run()
     """
 
-    def __init__(self, failure: FailureInfo):
+    def __init__(self, failure: FailureInfo, trace_id: str = None):
         self.failure = failure
+        # trace_id:默认自生成;API 层可预生成传入(提交任务时即返回给前端,
+        # 前端凭它订阅 SSE 实时思考流——后台任务尚未开始就能先连上)
+        self.trace_id = trace_id or uuid.uuid4().hex
         self.messages: list = []        # 完整对话历史(system/user/assistant/tool)
         self.iterations: list = []      # ReAct 轨迹(AgentIteration)
         self.suggestion_ids: list = []  # 本次运行产出的补丁 ID(汇总用)
+        self._last_patch_id = None      # 最近一次生成的补丁 ID(轨迹回填用)
+        self._verified_passed = False   # 早停信号:带 patch_id 的验证运行 PASSED
+
+    # ==================== 轨迹埋点 ====================
+
+    def _record_cost(self, resp) -> None:
+        """拦截 LLM response.usage,按通义千问官方计价异步写入 agent_costs。
+
+        计费是旁路能力:usage 缺失/DB 故障全部吞掉只记日志,绝不影响主流程。
+        """
+        try:
+            usage = getattr(resp, "usage", None)
+            if usage is None:
+                return
+            db.save_cost_async(
+                trace_id=self.trace_id,
+                model=AI_MODEL,
+                input_tokens=getattr(usage, "prompt_tokens", 0) or 0,
+                output_tokens=getattr(usage, "completion_tokens", 0) or 0,
+                task_id=self.failure.task_id,
+            )
+        except Exception:  # noqa: BLE001 计费拦截自身崩溃也绝不影响主流程
+            logger.warning("成本统计失败(已忽略): trace=%s", self.trace_id, exc_info=True)
+
+    def _save_trajectory(self, round_num: int, thought: str, tool_result: str = None) -> None:
+        """异步写一条 ReAct 轨迹(每轮 LLM 调用前后调用)。
+
+        走 db.save_trajectory_async 的后台线程,任何 DB 故障只记日志,
+        不会影响 Agent 主流程——可观测性绝不能拖垮修复本身。
+        """
+        db.save_trajectory_async(
+            trace_id=self.trace_id,
+            round_num=round_num,
+            thought=thought,
+            tool_result=tool_result,
+            patch_id=self._last_patch_id,
+            eval_case_id=getattr(self.failure, "eval_case_id", None),
+        )
 
     # ==================== 对话组装 ====================
 
     def _build_messages(self) -> None:
-        """组装初始消息:system(角色与规则) + user(失败用例上下文)。"""
+        """组装初始消息:system(角色与规则+RAG Few-shot) + user(失败用例上下文)。
+
+        RAG 记忆:用当前 failure_log 检索 Top-3 相似历史修复案例拼入 System Prompt,
+        检索失败/空库返回空串,静默跳过——记忆是增益不是依赖。
+        """
+        fewshot = memory.build_fewshot_block(self.failure.error_log, top_k=3)
         self.messages = [
-            {"role": "system", "content": SYSTEM_PROMPT.format(max_iterations=MAX_ITERATIONS)},
+            {"role": "system", "content": SYSTEM_PROMPT.format(max_iterations=MAX_ITERATIONS) + fewshot},
             {
                 "role": "user",
                 "content": (
@@ -124,20 +188,29 @@ class AutoFixAgent:
 
         self._build_messages()
         final_answer = None
+        # 轨迹(第 0 轮):记录本次运行的起点上下文
+        self._save_trajectory(0, f"[启动] case={self.failure.case_name} file={self.failure.file_path}")
 
         # 最多 MAX_ITERATIONS 轮"思考-行动";for...else:循环跑满未 break 时兜底
         for round_no in range(1, MAX_ITERATIONS + 1):
             # ---- 1. Reasoning:调 LLM 决策本轮动作 ----
+            # 轨迹"前"半段:LLM 调用前先落一轮请求标记(含上下文规模)
+            self._save_trajectory(round_no, f"[LLM请求] 第 {round_no} 轮,携带 {len(self.messages)} 条消息")
             try:
-                resp = client.chat.completions.create(
+                # tenacity 包装:网络抖动/限流自动指数退避重试(最多 3 次)
+                resp = _create_completion(
+                    client,
                     model=AI_MODEL,
                     messages=self.messages,
                     tools=tools.OPENAI_TOOLS,   # OpenAI function calling 规范的 Schema
                     temperature=TEMPERATURE,
                 )
                 msg = resp.choices[0].message
-            except Exception as exc:  # noqa: BLE001 网络/限流/超时等
-                logger.exception("LLM 调用失败(第 %s 轮)", round_no)
+                # 成本统计:拦截 response.usage,按官方计价异步落库(失败只记日志)
+                self._record_cost(resp)
+            except Exception as exc:  # noqa: BLE001 重试耗尽后的最终失败(网络/限流/超时等)
+                logger.exception("LLM 调用失败(第 %s 轮,已重试)", round_no)
+                self._save_trajectory(round_no, f"[LLM调用失败] {exc}")
                 return self._result(success=False, error=f"LLM 调用失败: {exc}", final_answer=final_answer)
 
             # ---- 无 tool_calls:模型给出最终答案,ReAct 结束 ----
@@ -146,6 +219,8 @@ class AutoFixAgent:
                 self.iterations.append(AgentIteration(
                     index=round_no, thought=msg.content, action=None, observation=None,
                 ))
+                # 轨迹:最终结论落库(补丁有则已通过 _last_patch_id 关联)
+                self._save_trajectory(round_no, f"[最终结论] {final_answer or ''}")
                 break
 
             # ---- 2. Acting:记录 assistant 消息(含 tool_calls)并逐个执行工具 ----
@@ -185,9 +260,41 @@ class AutoFixAgent:
                 action=", ".join(actions),
                 observation="\n".join(observations),
             ))
+
+            # 轨迹"后"半段:本轮 LLM 思考 + 全部工具执行结果落库
+            self._save_trajectory(
+                round_no,
+                thought=msg.content or "",
+                tool_result=json.dumps(
+                    [
+                        {"tool": a, "summary": o}
+                        for a, o in zip(actions, observations)
+                    ],
+                    ensure_ascii=False,
+                ),
+            )
+
+            # ---- 迭代早停:补丁验证通过(PASSED)即任务完成,不再消耗剩余轮次 ----
+            if self._verified_passed:
+                final_answer = "补丁已通过 pytest 验证(PASSED),修复完成,提前结束迭代。"
+                self._save_trajectory(round_no, f"[早停] {final_answer}")
+                break
         else:
             # 跑满轮数仍无最终答案:兜底说明(补丁若已生成仍可在 DB 中查看)
             final_answer = "已达最大迭代次数,过程记录见 iterations;已生成的补丁建议见 suggestions。"
+            self._save_trajectory(MAX_ITERATIONS, f"[轮次用尽] {final_answer}")
+
+        # ---- RAG 记忆:修复成功(有补丁且验证通过)才写入,失败案例不入库 ----
+        # 写入 failure_log 向量 + 补丁/根因元数据,供后续修复 Few-shot 检索;
+        # 记忆写入自带降级,失败只记日志。
+        if self.suggestion_ids and self._verified_passed:
+            memory.remember_case(
+                failure_log=self.failure.error_log,
+                case_name=self.failure.case_name,
+                file_path=self.failure.file_path,
+                patch_id=self._last_patch_id,
+                explanation=(final_answer or "")[:600],
+            )
 
         logger.info(
             "Auto-Fix 完成: case=%s 补丁=%s 轮数=%s",
@@ -221,6 +328,17 @@ class AutoFixAgent:
         # 收集补丁 ID 供结果汇总(verify 状态由 run_pytest 回写 DB)
         if name == "generate_patch" and result.success and result.data and "patch_id" in result.data:
             self.suggestion_ids.append(result.data["patch_id"])
+            self._last_patch_id = result.data["patch_id"]  # 轨迹表回填用
+            # LLM-as-judge:作者(Agent)与评审员分离,异步评审该补丁
+            # (失败只记日志,绝不阻塞 ReAct 循环)
+            judge.judge_suggestion_async(result.data["patch_id"])
+
+        # 早停信号:带 patch_id 的验证运行 PASSED(普通复现运行通过不算)
+        if (name == "run_pytest"
+                and result.success
+                and result.data and result.data.get("passed")
+                and arguments.get("patch_id")):
+            self._verified_passed = True
         return result
 
     # ==================== 结果汇总 ====================
@@ -248,6 +366,7 @@ class AutoFixAgent:
         return AgentRunResult(
             case_name=self.failure.case_name,
             file_path=self.failure.file_path,
+            trace_id=self.trace_id,
             success=success and error is None,
             verified=verified,
             iterations=self.iterations,
@@ -270,8 +389,10 @@ def auto_fix_case(
     case_name: str,
     file_path: str,
     error_log: str,
-) -> None:
-    """FastAPI BackgroundTasks 入口(与平台 run_task 用法一致,无返回值)。
+    eval_case_id: int = None,
+    trace_id: str = None,
+) -> AgentRunResult:
+    """FastAPI BackgroundTasks 入口(与平台 run_task 用法一致)。
 
     在路由中的接入示例:
 
@@ -287,6 +408,9 @@ def auto_fix_case(
             )
 
     修复建议与验证结论均已落库(fix_suggestions 表),前端可轮询查询。
+    评估脚本(cli/run_eval.py)也走本入口:传 eval_case_id 回填轨迹关联。
+    trace_id:API 层预生成时传入(前端凭它订阅 SSE 实时思考流)。
+    返回 AgentRunResult(含 trace_id,可到 agent_trajectories 回放全过程)。
     """
     result = AutoFixAgent(FailureInfo(
         task_id=task_id,
@@ -294,9 +418,11 @@ def auto_fix_case(
         case_name=case_name,
         file_path=file_path,
         error_log=error_log or "",
-    )).run()
+        eval_case_id=eval_case_id,
+    ), trace_id=trace_id).run()
     logger.info(
-        "auto_fix_case 完成: task=%s case=%s success=%s patches=%s verified=%s",
+        "auto_fix_case 完成: task=%s case=%s success=%s patches=%s verified=%s trace=%s",
         task_id, case_name, result.success,
-        [s.id for s in result.suggestions], result.verified,
+        [s.id for s in result.suggestions], result.verified, result.trace_id,
     )
+    return result

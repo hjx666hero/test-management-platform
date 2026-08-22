@@ -20,7 +20,8 @@ from .allure_parser import parse_failures
 
 logger = logging.getLogger("tms.ai_analyzer")
 
-DASHSCOPE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+# 入口随 config 走(公共 DashScope 或专属 MaaS 实例),与 Agent 共用同一模型配置
+DASHSCOPE_URL = f"{config.AI_BASE_URL.rstrip('/')}/chat/completions"
 
 
 def _call_qwen(request_snapshot: dict, response_snapshot: dict, error_message: str) -> str:

@@ -29,6 +29,15 @@ DEFAULT_BASE_URL = os.environ.get("TMS_DEFAULT_BASE_URL", "http://localhost:8080
 # ===== 通义千问 =====
 DASHSCOPE_API_KEY = os.environ.get("DASHSCOPE_API_KEY", "")
 AI_MODEL = os.environ.get("TMS_AI_MODEL", "qwen-plus")
+# LLM 入口(OpenAI 兼容模式):
+# - 公共 DashScope: https://dashscope.aliyuncs.com/compatible-mode/v1
+# - 专属实例(MaaS): https://ws-xxxx.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+AI_BASE_URL = os.environ.get(
+    "TMS_AI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"
+)
+# 计价(元/千token,用于 Agent 成本看板;不同模型单价不同,换模型时一并改)
+AI_PRICE_INPUT_PER_1K = float(os.environ.get("TMS_AI_PRICE_INPUT", "0.0008"))
+AI_PRICE_OUTPUT_PER_1K = float(os.environ.get("TMS_AI_PRICE_OUTPUT", "0.002"))
 AI_ENABLED = bool(DASHSCOPE_API_KEY)
 
 # ===== CORS =====

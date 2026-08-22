@@ -17,6 +17,12 @@ dist/
 
 # 运行时数据
 backend/data/
+# RAG 向量库(chromadb 本地持久化,首次运行自动生成)
+backend/chroma_data/
+# 评估报告(本地运行产物)
+backend/eval_report*.json
+# playwright 截图用浏览器(临时)
+.pw-browsers/
 
 # IDE
 .idea/

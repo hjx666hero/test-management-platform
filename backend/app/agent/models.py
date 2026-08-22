@@ -21,6 +21,7 @@ class FailureInfo(BaseModel):
     error_log: str = Field(..., description="失败日志(断言信息/异常堆栈)")
     task_id: Optional[int] = Field(None, description="来源任务 ID,便于补丁记录追溯(可选)")
     result_id: Optional[int] = Field(None, description="来源用例结果 ID(可选)")
+    eval_case_id: Optional[int] = Field(None, description="评估场景 ID(评估运行时回填,便于轨迹关联)")
 
 
 # ==================== 2. 工具执行结果(Observation) ====================
@@ -68,6 +69,7 @@ class AgentRunResult(BaseModel):
 
     case_name: str
     file_path: str
+    trace_id: Optional[str] = Field(None, description="本次运行唯一标识(关联 agent_trajectories 表,可回放全过程)")
     success: bool = Field(..., description="是否产出至少一个修复补丁")
     verified: Optional[bool] = Field(None, description="补丁验证结果(None=Agent 未做验证)")
     iterations: list[AgentIteration] = Field(default_factory=list, description="ReAct 思考-行动轨迹")
